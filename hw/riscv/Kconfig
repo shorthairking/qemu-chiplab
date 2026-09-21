@@ -9,6 +9,14 @@ config IBEX
 
 # RISC-V machines in alphabetical order
 
+config RISCV_CHIPLAB
+    bool
+    default y
+    depends on RISCV32
+    select RISCV_ACLINT
+    select SERIAL_MM
+    select SIFIVE_PLIC
+
 config MICROCHIP_PFSOC
     bool
     default y
