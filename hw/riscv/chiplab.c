@@ -10,8 +10,9 @@
  *
  *   0x0000_0000  DDR3             128 MiB  machine RAM
  *   0x1C00_0000  SPI XIP window    16 MiB  flash offset 0x000000 (XIP, read-only)
- *   0x03F0_0000  -dtb             payload  FDT for U-Boot's booti
- *   0x0400_0000  -kernel          payload  Linux Image (raw)
+ *   0x02F0_0000  -dtb             payload  FDT for U-Boot's booti
+ *   0x0300_0000                 boot chain  U-Boot/OpenSBI DTB (FW_JUMP_FDT_ADDR)
+ *   0x0340_0000  -kernel          payload  Linux Image (raw)
  *   0x0600_0000  -initrd          payload  initramfs (cpio/newc)
  *   0x1FD0_0000  confreg           64 KiB  platform DMA order register @ 0x1160
  *   0x1FE0_01E0  UART0 (16550)     0x100   8-bit registers, 33 MHz
@@ -76,16 +77,26 @@
  *   0x00000000..0x000FFFFF  early boot scratch (boot_stub stack-free, unused)
  *   0x01000000..0x010FFFFF  OpenSBI (loaded by the boot stub)
  *   0x02000000..0x0207FFFF  U-Boot text/data (pre-relocation)
- *   0x03F00000..0x03FFFFFF  FDT           (-dtb)      < 1 MiB, below the kernel
- *   0x04000000..0x05FFFFFF  kernel Image  (-kernel)   32 MiB window
+ *   0x02F00000..0x02FFFFFF  FDT           (-dtb)      < 1 MiB, below the kernel
+ *   0x03000000..0x030017FF  DTB loaded by the boot stub (FW_JUMP_FDT_ADDR)
+ *   0x03400000..0x05FFFFFF  kernel Image  (-kernel)   44 MiB window
+ *                           (4 MiB aligned - RV32 Linux BUGs in setup_vm() if
+ *                            the Image is not PMD_SIZE aligned, see
+ *                            arch/riscv/mm/init.c "Sanity check alignment";
+ *                            above the boot-chain FDT, below the initrd.
+ *                            Linux ignores RAM below its own load address
+ *                            (drivers/of/fdt.c), so 0x03400000 leaves 76 MiB
+ *                            of the 128 MiB usable instead of 64 MiB)
+ *                           (Linux ignores RAM below its own load address,
+
  *   0x06000000..0x07AFFFFF  initramfs     (-initrd)   26 MiB window
  *   0x07B00000..0x07FFFFFF  relocated U-Boot + malloc (SYS_MALLOC_LEN = 4 MiB)
  */
-#define CHIPLAB_KERNEL_ADDR     0x04000000
+#define CHIPLAB_KERNEL_ADDR     0x03400000
 #define CHIPLAB_KERNEL_MAX      (32 * MiB)
 #define CHIPLAB_INITRD_ADDR     0x06000000
 #define CHIPLAB_INITRD_MAX      (26 * MiB)
-#define CHIPLAB_DTB_ADDR        0x03f00000
+#define CHIPLAB_DTB_ADDR        0x02f00000
 #define CHIPLAB_DTB_MAX         (1 * MiB)
 
 #define CHIPLAB_XIP_BASE        0x1c000000
