@@ -9,7 +9,10 @@
  * Address map (rv32gc-cpu/docs/kb/platform-facts.md + u-boot chiplab-rv32.dts):
  *
  *   0x0000_0000  DDR3             128 MiB  machine RAM
- *   0x1C00_0000  SPI XIP window     1 MiB  flash offset 0x000000 (XIP, read-only)
+ *   0x1C00_0000  SPI XIP window    16 MiB  flash offset 0x000000 (XIP, read-only)
+ *   0x03F0_0000  -dtb             payload  FDT for U-Boot's booti
+ *   0x0400_0000  -kernel          payload  Linux Image (raw)
+ *   0x0600_0000  -initrd          payload  initramfs (cpio/newc)
  *   0x1FD0_0000  confreg           64 KiB  platform DMA order register @ 0x1160
  *   0x1FE0_01E0  UART0 (16550)     0x100   8-bit registers, 33 MHz
  *   0x1FE7_8000  NAND controller  0x1000   K9F1G08U0C + DMA doorbell @ 0x40
@@ -61,8 +64,38 @@
 
 #define CHIPLAB_DDR_SIZE        (128 * MiB)
 
+/*
+ * Optional payloads pre-loaded into DDR before reset (-kernel/-initrd/-dtb).
+ * They are only *placed* in RAM: the CPU still resets into the SPI XIP window
+ * (boot_stub -> OpenSBI -> U-Boot), and U-Boot boots them, e.g.
+ *
+ *   setenv filesize 0x<initrd size>
+ *   booti 0x04000000 0x06000000:${filesize} 0x03f00000
+ *
+ * Layout check (128 MiB DDR3):
+ *   0x00000000..0x000FFFFF  early boot scratch (boot_stub stack-free, unused)
+ *   0x01000000..0x010FFFFF  OpenSBI (loaded by the boot stub)
+ *   0x02000000..0x0207FFFF  U-Boot text/data (pre-relocation)
+ *   0x03F00000..0x03FFFFFF  FDT           (-dtb)      < 1 MiB, below the kernel
+ *   0x04000000..0x05FFFFFF  kernel Image  (-kernel)   32 MiB window
+ *   0x06000000..0x07AFFFFF  initramfs     (-initrd)   26 MiB window
+ *   0x07B00000..0x07FFFFFF  relocated U-Boot + malloc (SYS_MALLOC_LEN = 4 MiB)
+ */
+#define CHIPLAB_KERNEL_ADDR     0x04000000
+#define CHIPLAB_KERNEL_MAX      (32 * MiB)
+#define CHIPLAB_INITRD_ADDR     0x06000000
+#define CHIPLAB_INITRD_MAX      (26 * MiB)
+#define CHIPLAB_DTB_ADDR        0x03f00000
+#define CHIPLAB_DTB_MAX         (1 * MiB)
+
 #define CHIPLAB_XIP_BASE        0x1c000000
-#define CHIPLAB_XIP_SIZE        (1 * MiB)
+/*
+ * XIP main window: the whole 16 MiB SPI device is visible at 0x1C00_0000
+ * (dts: spi-xip@1c000000 reg = <0x1c000000 0x1000000>; the platform's
+ * axi_mux only decodes addr[31:20]==0x1C0, i.e. 1 MiB, so the upper 15 MiB is
+ * a model-level extension - documented in docs/linux-port/README.md).
+ */
+#define CHIPLAB_XIP_SIZE        (16 * MiB)
 #define CHIPLAB_XIP_ALIAS_BASE  0x1fe80000
 #define CHIPLAB_XIP_ALIAS_SIZE  (64 * KiB)
 /* alias window 0x1FE8_0000+N aliases flash offset 0x00E8_0000+N */
@@ -1270,6 +1303,52 @@ static void chiplab_machine_init(MachineState *machine)
     s->dma.nand = &s->nand;
     sysbus_realize(SYS_BUS_DEVICE(&s->dma), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->dma), 0, chiplab_memmap[CHIPLAB_DEV_CONFREG].base);
+
+    /*
+     * Optional DDR payloads: -kernel / -initrd / -dtb are loaded into RAM
+     * before reset so that U-Boot can boot them (see the address layout in the
+     * CHIPLAB_*_ADDR comment above).  Nothing is patched: the FDT comes from
+     * -dtb (or from the SPI image for the U-Boot stage) and the kernel command
+     * line is the one in the FDT /chosen.
+     */
+    if (machine->kernel_filename) {
+        ssize_t klen = load_image_targphys(machine->kernel_filename,
+                                           CHIPLAB_KERNEL_ADDR,
+                                           CHIPLAB_KERNEL_MAX);
+        if (klen < 0) {
+            error_report("chiplab: could not load kernel '%s'",
+                         machine->kernel_filename);
+            exit(1);
+        }
+        info_report("chiplab: kernel '%s' loaded at 0x%08x (%zd bytes)",
+                    machine->kernel_filename, CHIPLAB_KERNEL_ADDR, klen);
+    }
+    if (machine->initrd_filename) {
+        ssize_t ilen = load_image_targphys(machine->initrd_filename,
+                                           CHIPLAB_INITRD_ADDR,
+                                           CHIPLAB_INITRD_MAX);
+        if (ilen < 0) {
+            error_report("chiplab: could not load initrd '%s'",
+                         machine->initrd_filename);
+            exit(1);
+        }
+        info_report("chiplab: initrd '%s' loaded at 0x%08x (%zd bytes); "
+                    "use 'setenv filesize 0x%zx' + "
+                    "'booti 0x%08x 0x%08x:${filesize} 0x%08x'",
+                    machine->initrd_filename, CHIPLAB_INITRD_ADDR, ilen,
+                    (size_t)ilen, CHIPLAB_KERNEL_ADDR, CHIPLAB_INITRD_ADDR,
+                    CHIPLAB_DTB_ADDR);
+    }
+    if (machine->dtb) {
+        ssize_t dlen = load_image_targphys(machine->dtb, CHIPLAB_DTB_ADDR,
+                                           CHIPLAB_DTB_MAX);
+        if (dlen < 0) {
+            error_report("chiplab: could not load dtb '%s'", machine->dtb);
+            exit(1);
+        }
+        info_report("chiplab: dtb '%s' loaded at 0x%08x (%zd bytes)",
+                    machine->dtb, CHIPLAB_DTB_ADDR, dlen);
+    }
 }
 
 static char *chiplab_machine_get_nand_image(Object *obj, Error **errp)
