@@ -1,6 +1,14 @@
 config DP8393X
     bool
 
+# Loongson Chiplab FPGA SoC (Artix-7 A200T) DEC 21140 "Tulip" compatible
+# MAC, MMIO (no PCI). CSR0..CSR11 at byte offset n*8 in a 64 KiB window at
+# 0x1ff00000, 4 x 32 bit descriptor ring, software bit-banged MII
+# management channel on CSR9. Selected by the chiplab machine; model in
+# hw/net/chiplab_dmfe.c.
+config CHIPLAB_DMFE
+    bool
+
 config NE2000_COMMON
     bool
 

@@ -16,6 +16,7 @@ config RISCV_CHIPLAB
     select RISCV_ACLINT
     select SERIAL_MM
     select SIFIVE_PLIC
+    select CHIPLAB_DMFE
 
 config MICROCHIP_PFSOC
     bool

@@ -44,12 +44,14 @@
 #include "hw/intc/riscv_aclint.h"
 #include "hw/intc/sifive_plic.h"
 #include "hw/loader.h"
+#include "hw/net/chiplab_dmfe.h"
 #include "hw/qdev-properties.h"
 #include "hw/riscv/boot.h"
 #include "hw/riscv/riscv_hart.h"
 #include "hw/sysbus.h"
 #include "sysemu/block-backend.h"
 #include "sysemu/blockdev.h"
+#include "net/net.h"
 #include "sysemu/sysemu.h"
 #include "exec/address-spaces.h"
 
@@ -121,6 +123,19 @@
 #define CHIPLAB_NAND_BASE       0x1fe78000
 #define CHIPLAB_NAND_SIZE       0x1000
 
+/*
+ * DEC 21140 "Tulip" 兼容 MAC：AXI 从口 s4，addr[31:16]==0x1ff0
+ * （chiplab/IP/AMBA/axi_mux_syn.v:859/950），窗口 64 KiB。
+ * CSR n 在字节偏移 n*8（maccsr2axi.v:88 CSRADDRESSWIDTH=8 ⇒ 只用 addr[7:0]，
+ * 因此 CSR 块在 64 KiB 里每 256 B 混叠一次，模型的 MMIO 尺寸按 0x1000 够用）。
+ * 中断：平台 int_out[0] = mac_int（soc_top.v:597/725），本机 PLIC 沿用
+ * "int_out 位号 == PLIC 源号"的口径（UART = int_out[1] = 源 1），故 MAC = 源 0。
+ * v1 驱动是纯轮询，中断线接上只为模型完整性与后续 v2 使用。
+ */
+#define CHIPLAB_MAC_BASE        0x1ff00000
+#define CHIPLAB_MAC_SIZE        0x1000
+#define CHIPLAB_MAC_IRQ         0             /* PLIC source 0 */
+
 #define CHIPLAB_UART0_BASE      0x1fe001e0
 
 #define CHIPLAB_CLINT_BASE      0x1f000000
@@ -149,6 +164,7 @@ enum {
     CHIPLAB_DEV_SPI_ALIAS,
     CHIPLAB_DEV_CLINT,
     CHIPLAB_DEV_PLIC,
+    CHIPLAB_DEV_MAC,
 };
 
 static const MemMapEntry chiplab_memmap[] = {
@@ -160,6 +176,7 @@ static const MemMapEntry chiplab_memmap[] = {
     [CHIPLAB_DEV_SPI_ALIAS] = { CHIPLAB_XIP_ALIAS_BASE, CHIPLAB_XIP_ALIAS_SIZE },
     [CHIPLAB_DEV_CLINT]     = { CHIPLAB_CLINT_BASE,  CHIPLAB_CLINT_SIZE },
     [CHIPLAB_DEV_PLIC]      = { CHIPLAB_PLIC_BASE,   CHIPLAB_PLIC_SIZE },
+    [CHIPLAB_DEV_MAC]       = { CHIPLAB_MAC_BASE,    CHIPLAB_MAC_SIZE },
 };
 
 /* ======================================================================== */
@@ -481,6 +498,36 @@ struct ChiplabNandState {
 
 /* ---- backing store helpers -------------------------------------------- */
 
+/*
+ * Optional page-level trace (CHIPLAB_NAND_TRACE=1 in the environment).  One
+ * line per page read / program / block erase so a guest driver's addressing
+ * can be compared with what actually reaches the backing image.  Only used
+ * for bring-up debugging; it changes no device behaviour.
+ */
+static bool chiplab_nand_trace_enabled(void)
+{
+    static int on = -1;
+
+    if (on < 0) {
+        on = getenv("CHIPLAB_NAND_TRACE") != NULL;
+    }
+    return on;
+}
+
+static void chiplab_nand_trace(const ChiplabNandState *s, const char *op,
+                               uint32_t page, const uint8_t *data)
+{
+    if (!chiplab_nand_trace_enabled()) {
+        return;
+    }
+    fprintf(stderr, "nand-trace %s page=%u main=%u spare=%u "
+            "data=%02x%02x%02x%02x ecc=%02x\n",
+            op, page, s->main_op, s->spare_op,
+            data ? data[0] : 0, data ? data[1] : 0,
+            data ? data[2] : 0, data ? data[3] : 0,
+            data ? data[CHIPLAB_NAND_PAGE_SIZE + 36] : 0);
+}
+
 static void chiplab_nand_load(ChiplabNandState *s, uint64_t off,
                               void *buf, size_t len)
 {
@@ -635,6 +682,7 @@ static void chiplab_nand_do_read(ChiplabNandState *s)
     s->cursor = 0;
     s->status = NAND_STATUS_OK;
     s->done = true;
+    chiplab_nand_trace(s, "R", page, s->frame);
 }
 
 static void chiplab_nand_do_write(ChiplabNandState *s)
@@ -672,6 +720,7 @@ static void chiplab_nand_program_page(ChiplabNandState *s)
                            s->frame + pos, CHIPLAB_NAND_OOB_SIZE);
     }
     s->status = NAND_STATUS_OK;
+    chiplab_nand_trace(s, "W", page, s->frame);
 }
 
 static void chiplab_nand_erase_block(ChiplabNandState *s)
@@ -687,6 +736,7 @@ static void chiplab_nand_erase_block(ChiplabNandState *s)
                              (uint64_t)CHIPLAB_NAND_PAGES_PER_BLOCK *
                              CHIPLAB_NAND_PAGE_TOTAL);
     s->status = NAND_STATUS_OK;
+    chiplab_nand_trace(s, "E", chiplab_nand_page(s), NULL);
 }
 
 /*
@@ -1199,6 +1249,7 @@ struct ChiplabMachineState {
     ChiplabSpiFlashState flash;
     ChiplabNandState nand;
     ChiplabDmaState dma;
+    DeviceState *mac;
     DeviceState *plic;
 
     char *nand_image;
@@ -1314,6 +1365,18 @@ static void chiplab_machine_init(MachineState *machine)
     s->dma.nand = &s->nand;
     sysbus_realize(SYS_BUS_DEVICE(&s->dma), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(&s->dma), 0, chiplab_memmap[CHIPLAB_DEV_CONFREG].base);
+
+    /*
+     * DEC 21140 兼容 MAC（以太网）。必须先用 qemu_configure_nic_device()
+     * 把 -nic/默认网卡配置塞进设备的 mac/netdev 属性，再 realize。
+     */
+    s->mac = qdev_new(TYPE_CHIPLAB_DMFE);
+    qemu_configure_nic_device(s->mac, true, NULL);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s->mac), &error_fatal);
+    sysbus_mmio_map(SYS_BUS_DEVICE(s->mac), 0,
+                    chiplab_memmap[CHIPLAB_DEV_MAC].base);
+    sysbus_connect_irq(SYS_BUS_DEVICE(s->mac), 0,
+                       qdev_get_gpio_in(DEVICE(s->plic), CHIPLAB_MAC_IRQ));
 
     /*
      * Optional DDR payloads: -kernel / -initrd / -dtb are loaded into RAM
